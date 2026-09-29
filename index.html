@@ -221,6 +221,30 @@ button.small { width: auto; margin: 0; padding: 5px 8px; font-size: 9px; }
   background: rgba(255,45,149,.08); font-size: 10px;
 }
 
+/* Functional group legend — analysis layer only */
+.funcLegend {
+  position: absolute; left: 12px; bottom: 36px; z-index: 15;
+  padding: 8px 10px; min-width: 160px;
+  background: rgba(8,14,20,.92); border: 1px solid var(--border);
+  font-size: 9px; letter-spacing: 0.5px; pointer-events: none;
+  backdrop-filter: blur(4px);
+}
+.funcLegend .flTitle {
+  color: var(--cyan); font-size: 9px; letter-spacing: 1.5px; margin-bottom: 6px;
+}
+.funcLegend .flRow {
+  display: flex; align-items: center; gap: 6px; margin: 3px 0; color: var(--text);
+}
+.funcLegend .flDot {
+  width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+  box-shadow: 0 0 6px currentColor;
+}
+.funcLegend .flCount { color: var(--muted); margin-left: auto; }
+.funcLegend .flDiag {
+  margin-top: 6px; padding-top: 5px; border-top: 1px solid var(--border);
+  color: var(--muted); line-height: 1.45;
+}
+
 .metrics { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; margin-top: 8px; }
 .metric {
   padding: 8px; background: #060b10; border: 1px solid var(--border); text-align: center;
@@ -301,6 +325,11 @@ button.small { width: auto; margin: 0; padding: 5px 8px; font-size: 9px; }
           </div>
           <canvas id="canvas3d"></canvas>
           <div class="hint">DRAG · ROTATE &nbsp;|&nbsp; WHEEL · ZOOM &nbsp;|&nbsp; CLICK · SELECT</div>
+          <div id="funcLegend" class="funcLegend">
+            <div class="flTitle">FUNKTIONALE BAUGRUPPEN</div>
+            <div id="funcLegendRows"></div>
+            <div id="funcLegendDiag" class="flDiag">—</div>
+          </div>
           <div class="toolbar">
             <button id="resetCamBtn">RESET</button>
             <button id="focusTimelineBtn">TIMELINE</button>
@@ -401,6 +430,152 @@ const EMBED_CONFIG = Object.freeze({
   MODEL: 'Xenova/multilingual-e5-small',
   DIM: 384
 });
+
+/* =========================================================
+   FUNCTIONAL GROUP VISUALIZATION (analysis layer only)
+   Does NOT write into embeddings, pos3d, edges, or retrieval math.
+   Classification is deterministic from name + content + path.
+========================================================= */
+const FUNC_GROUPS = Object.freeze({
+  UI:        { id: 2, key: 'UI',        label: 'UI',                 color: [0.25, 0.75, 1.00] }, // light blue
+  RENDER3D:  { id: 3, key: 'RENDER3D',  label: '3D / Rendering',     color: [0.20, 1.00, 0.55] }, // green
+  RETRIEVAL: { id: 4, key: 'RETRIEVAL', label: 'Retrieval / Semantic', color: [1.00, 0.45, 0.90] }, // violet-pink
+  GIT:       { id: 5, key: 'GIT',       label: 'Git / Project State', color: [1.00, 0.85, 0.20] }, // gold
+  DATA:      { id: 6, key: 'DATA',      label: 'Data / Storage',     color: [1.00, 0.55, 0.20] }, // orange
+  CORE:      { id: 7, key: 'CORE',      label: 'Core / Infrastructure', color: [0.55, 0.60, 0.70] }  // muted blue-gray
+});
+
+/**
+ * FUNKTION: classifySymbol()
+ *
+ * ZWECK:
+ * Ordnet ein Symbol-Node einer primären funktionalen Baugruppe zu
+ * (plus optionalen sekundären Treffern). Rein für Visualisierung /
+ * Ground-Truth-Analyse. Kein Einfluss auf Embeddings oder Retrieval.
+ *
+ * INPUT:  Symbol-Node (name, content, path, kind)
+ * OUTPUT: { primary, secondary[], scores }
+ *
+ * LOGIK:
+ * Score-basiert über Name- und Content-Signaturen (reproduzierbar,
+ * keine feste Node-ID-Liste). Höchster Score = primary.
+ */
+function classifySymbol(s) {
+  const name = String(s.name || '').toLowerCase();
+  const content = String(s.content || '');
+  const contentL = content.toLowerCase();
+  const path = String(s.path || '').toLowerCase();
+  const blob = name + '\n' + contentL;
+
+  const scores = { UI: 0, RENDER3D: 0, RETRIEVAL: 0, GIT: 0, DATA: 0, CORE: 0 };
+
+  // --- Retrieval / Semantic ---
+  if (/\b(embed|embedding|cosine|semantic|retrieval|topk|top-k|semantick|querytext|highlightmap|embeddingtext|embeddingcache)\b/.test(blob)) {
+    scores.RETRIEVAL += 3;
+  }
+  if (/^(embed|loadmodel|attachembeddings|computesemantic|runsemantic|embedquery|embedembedding|rebuildhighlight|clearretrieval|computeretrieval|renderretrieval|validatesemantic|getspatial|cosinesim|cosinetodistance)/.test(name)) {
+    scores.RETRIEVAL += 5;
+  }
+  if (/pipeline\s*\(\s*['"]feature-extraction['"]|pooling:\s*['"]mean['"]|normalize:\s*true/.test(contentL)) {
+    scores.RETRIEVAL += 3;
+  }
+
+  // --- 3D / Rendering ---
+  if (/\b(three\.|webglrenderer|perspectivecamera|orbitcontrols|buffergeometry|shadermaterial|points\b|linesegments|raycaster|gridhelper)\b/.test(contentL)) {
+    scores.RENDER3D += 3;
+  }
+  if (/^(initthree|resizethree|rebuildscene|layoutgraph|animate|focuscommit|disposeobj|onpointerdown)$/.test(name)) {
+    scores.RENDER3D += 5;
+  }
+  if (/\b(pos3d|graphnodes|pointsmesh|linesgroup|gl_pointsize|fragmentshader|vertexshader|additiveblending)\b/.test(blob)) {
+    scores.RENDER3D += 2;
+  }
+  if (/renderer\.setsize|camera\.aspect|updateprojectionmatrix/.test(contentL)) {
+    scores.RENDER3D += 3;
+  }
+
+  // --- UI (DOM / panels / list rendering / interaction) ---
+  if (/\b(getelementbyid|queryselector|innerhtml|textcontent|classlist|createelement)\b/.test(contentL)) {
+    scores.UI += 2;
+  }
+  if (/\$\(\s*['"]/.test(content)) {
+    scores.UI += 2;
+  }
+  if (/^(rendercommitlist|renderstructure|renderpendingfiles|showinspector|selectnode|updateheader|updatemetrics|onfilesselected|copycode|saveproject)$/.test(name)) {
+    scores.UI += 5;
+  }
+  if (/\b(panel|inspector|toolbar|hud|structtree|codebox|pendingfiles|commitlist|button|onclick|overlay)\b/.test(blob)) {
+    scores.UI += 2;
+  }
+  if (/\b(@media|viewport|grid-template|clientwidth|clientheight|overflow)\b/.test(contentL) && scores.RENDER3D < 4) {
+    scores.UI += 2;
+  }
+  // HTML/CSS-heavy symbols (sections from markup files)
+  if (/\.(css|html|htm)$/.test(path) && (s.kind === 'section' || /style|class=|<\/|flex|grid/.test(contentL))) {
+    scores.UI += 2;
+  }
+
+  // --- Git / Project State ---
+  if (/^(createcommit|selectcommit|deletecommit|deleteselectedcommit|rendercommitlist)$/.test(name)) {
+    scores.GIT += 4;
+  }
+  if (/\b(parent_commit|contains_file|contains_symbol|parenthash|commitid|pendingfiles|nextids)\b/.test(blob)) {
+    scores.GIT += 2;
+  }
+  if (/\btype:\s*['"]commit['"]|\.commits\.|state\.commits/.test(contentL)) {
+    scores.GIT += 2;
+  }
+
+  // --- Data / Storage ---
+  if (/^(opendb|dbgetall|dbput|dbputmany|dbdelete|restore|exportproject)$/.test(name)) {
+    scores.DATA += 5;
+  }
+  if (/\b(indexeddb|objectstore|transaction|idb|localstorage|export.*json|db_name|db_store)\b/.test(blob)) {
+    scores.DATA += 3;
+  }
+
+  // --- Core / Infrastructure ---
+  if (/^(uid|esc|log|now|findbalancedblock|extractsymbols|buildembeddingtext|detunit)$/.test(name)) {
+    scores.CORE += 4;
+  }
+  if (/^\$|reserved|addblock|lineat/.test(name)) {
+    scores.CORE += 2;
+  }
+
+  // Fallback: unknown → CORE
+  const maxScore = Math.max(...Object.values(scores));
+  if (maxScore === 0) scores.CORE = 1;
+
+  let primary = 'CORE';
+  let best = -1;
+  for (const key of Object.keys(scores)) {
+    if (scores[key] > best) {
+      best = scores[key];
+      primary = key;
+    }
+  }
+
+  // Tie-break: prefer more specific domains over CORE
+  if (best > 0) {
+    const tied = Object.keys(scores).filter(k => scores[k] === best);
+    if (tied.length > 1) {
+      const prio = ['RETRIEVAL', 'RENDER3D', 'UI', 'GIT', 'DATA', 'CORE'];
+      for (const p of prio) {
+        if (tied.includes(p)) { primary = p; break; }
+      }
+    }
+  }
+
+  const secondary = Object.keys(scores)
+    .filter(k => k !== primary && scores[k] >= 2)
+    .sort((a, b) => scores[b] - scores[a]);
+
+  return { primary, secondary, scores };
+}
+
+function funcGroupId(primaryKey) {
+  return (FUNC_GROUPS[primaryKey] && FUNC_GROUPS[primaryKey].id) || FUNC_GROUPS.CORE.id;
+}
 
 const state = {
   project: {
@@ -1740,11 +1915,16 @@ function showInspector(obj, kind) {
     $('inspTitle').textContent = 'SYMBOL';
     $('inspId').textContent = `${obj.kind}:${obj.name}`;
     $('inspText').textContent = obj.content;
+    const cls = classifySymbol(obj);
+    const pri = FUNC_GROUPS[cls.primary]?.label || cls.primary;
+    const sec = cls.secondary.map(k => FUNC_GROUPS[k]?.label || k).join(', ') || '—';
     $('inspMeta').innerHTML = `
       ID: ${esc(obj.id)}<br>
       FILE: ${esc(obj.path)}<br>
       RANGE: L${obj.startLine}–${obj.endLine}<br>
-      COMMIT: ${esc(obj.commitId)}
+      COMMIT: ${esc(obj.commitId)}<br>
+      FUNKTION: ${esc(pri)}<br>
+      NEBEN: ${esc(sec)}
     `;
   }
 }
@@ -1959,6 +2139,50 @@ function layoutGraph() {
   }
 }
 
+/**
+ * FUNKTION: updateFuncLegend()
+ *
+ * ZWECK:
+ * Zählt Symbol-Nodes je funktionaler Baugruppe (primary) und zeigt
+ * Legende + Diagnose. Nutzt dieselbe Klassifizierungslogik wie die Farben.
+ * Keine Mutation von Embeddings / pos3d.
+ */
+function updateFuncLegend() {
+  const rowsEl = $('funcLegendRows');
+  const diagEl = $('funcLegendDiag');
+  if (!rowsEl || !diagEl) return;
+
+  const counts = { UI: 0, RENDER3D: 0, RETRIEVAL: 0, GIT: 0, DATA: 0, CORE: 0 };
+  let multi = 0;
+  const symbols = state.selectedCommitId
+    ? state.symbols.filter(s => s.commitId === state.selectedCommitId)
+    : state.symbols;
+
+  for (const s of symbols) {
+    const cls = classifySymbol(s);
+    if (counts[cls.primary] != null) counts[cls.primary]++;
+    if (cls.secondary.length) multi++;
+  }
+
+  const order = ['UI', 'RENDER3D', 'RETRIEVAL', 'GIT', 'DATA', 'CORE'];
+  rowsEl.innerHTML = order.map(key => {
+    const g = FUNC_GROUPS[key];
+    const [r, gch, b] = g.color;
+    const css = `rgb(${Math.round(r * 255)},${Math.round(gch * 255)},${Math.round(b * 255)})`;
+    return `<div class="flRow">
+      <span class="flDot" style="background:${css};color:${css}"></span>
+      <span>${esc(g.label)}</span>
+      <span class="flCount">${counts[key]}</span>
+    </div>`;
+  }).join('');
+
+  const total = Object.values(counts).reduce((a, b) => a + b, 0);
+  diagEl.innerHTML =
+    `Symbole: ${total}` +
+    (state.selectedCommitId ? ' (Commit)' : ' (alle)') +
+    `<br>Mehrfach-Signale (≥2): ${multi}`;
+}
+
 function rebuildScene() {
   layoutGraph();
 
@@ -1977,6 +2201,8 @@ function rebuildScene() {
     // Retrieval highlight intensity: 0=none, 1=weak, 2=medium, 3=strong, 4=intersection
     // Pure visualization — does not alter positions, embeddings, or graph structure
     const highlights = new Float32Array(n);
+    // Functional group id for symbols (2–7); commits=0, files=1 (structural)
+    const funcs = new Float32Array(n);
     const hlMap = state.retrieval.highlightMap;
 
     graphNodes.forEach((node, i) => {
@@ -1989,6 +2215,17 @@ function rebuildScene() {
         (node.id === state.selectedNodeId)
           ? 1 : 0;
       highlights[i] = hlMap.has(node.id) ? (hlMap.get(node.id) || 0) : 0;
+
+      if (node.kind === 'symbol' && node.data) {
+        const cls = classifySymbol(node.data);
+        funcs[i] = funcGroupId(cls.primary);
+      } else if (node.kind === 'commit') {
+        funcs[i] = 0;
+      } else if (node.kind === 'file') {
+        funcs[i] = 1;
+      } else {
+        funcs[i] = FUNC_GROUPS.CORE.id;
+      }
     });
 
     const geo = new THREE.BufferGeometry();
@@ -1996,19 +2233,23 @@ function rebuildScene() {
     geo.setAttribute('aKind', new THREE.BufferAttribute(kinds, 1));
     geo.setAttribute('aSelected', new THREE.BufferAttribute(selected, 1));
     geo.setAttribute('aHighlight', new THREE.BufferAttribute(highlights, 1));
+    geo.setAttribute('aFunc', new THREE.BufferAttribute(funcs, 1));
 
     const mat = new THREE.ShaderMaterial({
       vertexShader: `
         attribute float aKind;
         attribute float aSelected;
         attribute float aHighlight;
+        attribute float aFunc;
         varying float vKind;
         varying float vSelected;
         varying float vHighlight;
+        varying float vFunc;
         void main() {
           vKind = aKind;
           vSelected = aSelected;
           vHighlight = aHighlight;
+          vFunc = aFunc;
           vec4 mv = modelViewMatrix * vec4(position, 1.0);
           gl_Position = projectionMatrix * mv;
           float size = aKind < 0.5 ? 12.0 : aKind < 1.5 ? 9.0 : 6.5;
@@ -2025,24 +2266,42 @@ function rebuildScene() {
         varying float vKind;
         varying float vSelected;
         varying float vHighlight;
+        varying float vFunc;
         void main() {
           vec2 p = gl_PointCoord - 0.5;
           float r = length(p);
           if (r > 0.5) discard;
           float core = 1.0 - smoothstep(0.02, 0.22, r);
           float glow = 1.0 - smoothstep(0.1, 0.5, r);
+          // Structural: commit / file
           vec3 pink = vec3(1.0, 0.18, 0.58);
           vec3 cyan = vec3(0.0, 0.9, 1.0);
-          vec3 green = vec3(0.0, 1.0, 0.62);
+          // Functional groups (symbols)
+          vec3 cUI        = vec3(0.25, 0.75, 1.00);
+          vec3 cRender3d  = vec3(0.20, 1.00, 0.55);
+          vec3 cRetrieval = vec3(1.00, 0.45, 0.90);
+          vec3 cGit       = vec3(1.00, 0.85, 0.20);
+          vec3 cData      = vec3(1.00, 0.55, 0.20);
+          vec3 cCore      = vec3(0.55, 0.60, 0.70);
           vec3 yellow = vec3(1.0, 0.9, 0.0);
-          // Retrieval palette (does not change base identity colors when highlight=0)
-          vec3 hlWeak   = vec3(1.0, 0.55, 0.15);  // orange
-          vec3 hlMed    = vec3(1.0, 0.35, 0.05);  // deep orange
-          vec3 hlStrong = vec3(1.0, 0.15, 0.05);  // red-orange
-          vec3 hlInter  = vec3(1.0, 0.0, 0.85);   // magenta (intersection)
-          vec3 c = vKind < 0.5 ? pink : vKind < 1.5 ? cyan : green;
+          // Retrieval highlight palette
+          vec3 hlWeak   = vec3(1.0, 0.55, 0.15);
+          vec3 hlMed    = vec3(1.0, 0.35, 0.05);
+          vec3 hlStrong = vec3(1.0, 0.15, 0.05);
+          vec3 hlInter  = vec3(1.0, 0.0, 0.85);
+
+          vec3 c;
+          if (vFunc < 0.5) c = pink;           // commit
+          else if (vFunc < 1.5) c = cyan;      // file
+          else if (vFunc < 2.5) c = cUI;
+          else if (vFunc < 3.5) c = cRender3d;
+          else if (vFunc < 4.5) c = cRetrieval;
+          else if (vFunc < 5.5) c = cGit;
+          else if (vFunc < 6.5) c = cData;
+          else c = cCore;
+
           if (vSelected > 0.5) c = yellow;
-          // Highlight overrides base color for matched nodes only
+          // Highlight overrides base/functional color for matched nodes only
           if (vHighlight > 3.5) c = hlInter;
           else if (vHighlight > 2.5) c = hlStrong;
           else if (vHighlight > 1.5) c = hlMed;
@@ -2115,6 +2374,9 @@ function rebuildScene() {
   $('hudStatus').textContent = state.selectedCommitId
     ? `${cCount} COMMITS · OPEN: ${fCount} FILES · ${sCount} SYMBOLS`
     : `${cCount} COMMITS · TIMELINE`;
+
+  // Functional group legend / counts (visualization only)
+  updateFuncLegend();
 }
 
 function focusCommit(c) {
