@@ -182,6 +182,45 @@ button.small { width: auto; margin: 0; padding: 5px 8px; font-size: 9px; }
 .inspector .txt { margin-bottom: 8px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; max-height: 180px; overflow-y: auto; }
 .inspector .meta { color: var(--muted); font-size: 10px; line-height: 1.5; }
 
+/* Retrieval Debug Panel — absolute overlay, does not alter layout grid */
+.retrievalPanel {
+  position: absolute; top: 40px; left: 12px; width: 300px;
+  max-height: calc(100% - 70px); overflow-y: auto; padding: 10px 12px;
+  background: rgba(8,14,20,.95); border: 1px solid var(--border);
+  z-index: 20; font-size: 10px; backdrop-filter: blur(6px);
+  display: none;
+}
+.retrievalPanel.visible { display: block; }
+.retrievalPanel h3 {
+  margin-bottom: 6px; color: var(--yellow); font-size: 10px; letter-spacing: 2px;
+}
+.retrievalPanel label { margin-top: 6px; }
+.retrievalPanel textarea {
+  min-height: 48px; font-size: 11px; margin-bottom: 4px;
+}
+.retrievalPanel .btnRow {
+  display: flex; gap: 4px; flex-wrap: wrap; margin-top: 6px;
+}
+.retrievalPanel .btnRow button {
+  width: auto; flex: 1; min-width: 60px; margin: 0; padding: 5px 6px; font-size: 9px;
+}
+.retrievalPanel .results {
+  margin-top: 8px; max-height: 220px; overflow-y: auto;
+  font-size: 10px; line-height: 1.4; color: var(--text);
+}
+.retrievalPanel .resItem {
+  padding: 5px 4px; border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+.retrievalPanel .resItem:hover { background: rgba(255,230,0,.08); }
+.retrievalPanel .resRank { color: var(--yellow); font-weight: 600; }
+.retrievalPanel .resSim { color: var(--green); }
+.retrievalPanel .resMeta { color: var(--muted); font-size: 9px; }
+.retrievalPanel .intersectionBox {
+  margin-top: 8px; padding: 6px; border: 1px solid var(--pink);
+  background: rgba(255,45,149,.08); font-size: 10px;
+}
+
 .metrics { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; margin-top: 8px; }
 .metric {
   padding: 8px; background: #060b10; border: 1px solid var(--border); text-align: center;
@@ -265,12 +304,32 @@ button.small { width: auto; margin: 0; padding: 5px 8px; font-size: 9px; }
           <div class="toolbar">
             <button id="resetCamBtn">RESET</button>
             <button id="focusTimelineBtn">TIMELINE</button>
+            <button id="showRetrievalBtn">RETRIEVAL</button>
           </div>
           <div id="inspector" class="inspector">
             <h3 id="inspTitle">INSPECTOR</h3>
             <div id="inspId" class="id">—</div>
             <div id="inspText" class="txt">—</div>
             <div id="inspMeta" class="meta">—</div>
+          </div>
+          <!-- Semantic Retrieval Debug Panel (overlay, non-invasive) -->
+          <div id="retrievalPanel" class="retrievalPanel">
+            <h3>SEMANTIC RETRIEVAL</h3>
+            <label>QUERY</label>
+            <textarea id="retrievalQuery" placeholder="z.B. UI Layout CSS responsive Viewport Smartphone"></textarea>
+            <div class="btnRow">
+              <button id="runQuery1Btn" class="green">Q1</button>
+              <button id="runQuery2Btn" class="pink">Q2</button>
+              <button id="runIntersectBtn">∩</button>
+              <button id="clearRetrievalBtn" class="danger">CLEAR</button>
+            </div>
+            <div class="btnRow" style="margin-top:4px">
+              <button id="toggleRetrievalBtn">PANEL OFF</button>
+            </div>
+            <div id="retrievalResults" class="results">
+              <div style="color:var(--muted)">Noch keine Query.</div>
+            </div>
+            <div id="retrievalIntersection" class="intersectionBox" style="display:none"></div>
           </div>
         </div>
       </div>
@@ -368,7 +427,20 @@ const state = {
   selectedKind: null,     // 'commit' | 'file' | 'symbol'
 
   db: null,
-  nextIds: { commit: 1, file: 1, symbol: 1, edge: 1 }
+  nextIds: { commit: 1, file: 1, symbol: 1, edge: 1 },
+
+  // Semantic Retrieval Debug (does not alter embeddings or pos3d)
+  // highlightMap: nodeId → intensity (0=none, 1=weak, 2=medium, 3=strong, 4=intersection)
+  retrieval: {
+    active: false,
+    query1: '',
+    query2: '',
+    k: 12,
+    results1: [],   // [{ nodeId, similarity, rank, name, kind, path, startLine, endLine }]
+    results2: [],
+    intersectionIds: [],
+    highlightMap: new Map()
+  }
 };
 
 const $ = id => document.getElementById(id);
@@ -826,6 +898,319 @@ function computeSemanticNeighborsForCommit(commitId) {
     }
     scored.sort((a, b) => b.similarity - a.similarity);
     si.semanticNeighbors = scored.slice(0, SEMANTIC_K);
+  }
+}
+
+/* =========================================================
+   SEMANTIC RETRIEVAL DEBUG
+   Query → same model (e5) → cosine against all symbol embeddings
+   → Top-K → highlightMap only (pos3d / embeddings / graph structure unchanged)
+========================================================= */
+
+/**
+ * FUNKTION: embedQueryText()
+ *
+ * ZWECK:
+ * Erzeugt ein 384D-Query-Embedding mit demselben Modell und denselben
+ * Pooling-/Normalize-Einstellungen wie die Node-Embeddings.
+ * Verwendet das e5-konforme Prefix "query: " (Nodes nutzen "passage: ").
+ *
+ * INPUT:  freier Query-String
+ * OUTPUT: number[384] (L2-normalisiert)
+ * CACHE:  nutzt state.embeddingCache mit Prefix-Key, um Doppelberechnung zu vermeiden
+ */
+async function embedQueryText(queryText) {
+  const key = `query::${queryText || ''}`;
+  if (state.embeddingCache.has(key)) {
+    return state.embeddingCache.get(key).slice();
+  }
+
+  const ready = await loadModel();
+  if (!ready || !state.extractor) {
+    throw new Error('Embedding-Modell nicht verfügbar.');
+  }
+
+  // e5 asymmetric: queries use "query: ", documents (nodes) use "passage: "
+  const output = await state.extractor(`query: ${queryText || ''}`, {
+    pooling: 'mean',
+    normalize: true
+  });
+  const vector = Array.from(output.data || output.tolist()[0]);
+  if (vector.length !== EMBED_CONFIG.DIM) {
+    throw new Error(`Unerwartete Dimension ${vector.length}`);
+  }
+
+  state.embeddingCache.set(key, vector.slice());
+  return vector.slice();
+}
+
+/**
+ * FUNKTION: runSemanticQuery()
+ *
+ * ZWECK:
+ * Vollständiger Retrieval-Durchlauf:
+ *   Query-Text
+ *     → embedQueryText (384D)
+ *     → cosineSim gegen alle Symbole mit embedding[384]
+ *     → Sortierung absteigend
+ *     → Top-K
+ *     → results + highlightMap aktualisieren
+ *     → rebuildScene (nur Farben)
+ *
+ * INPUT:
+ *   queryText  – natürliche Sprache
+ *   slot       – 1 oder 2 (zwei unabhängige Queries für Schnittmenge)
+ *   k          – Top-K (default state.retrieval.k)
+ *
+ * OUTPUT:
+ *   Array der Treffer (auch in state.retrieval.results1/results2)
+ *
+ * SEITENEFFEKTE:
+ *   state.retrieval.highlightMap, results1/2
+ *   rebuildScene() — Positionen bleiben unverändert
+ */
+async function runSemanticQuery(queryText, slot = 1, k = null) {
+  const topK = k != null ? k : state.retrieval.k;
+  const q = (queryText || '').trim();
+  if (!q) {
+    log('Retrieval: leere Query.', 'warn');
+    return [];
+  }
+
+  log(`Retrieval Q${slot}: „${q.slice(0, 60)}${q.length > 60 ? '…' : ''}“ …`, 'info');
+
+  let queryVec;
+  try {
+    queryVec = await embedQueryText(q);
+  } catch (e) {
+    log(`Retrieval Embedding-Fehler: ${e?.message || e}`, 'err');
+    return [];
+  }
+
+  // Alle Symbole mit gültigem 384D-Embedding (über alle Commits)
+  const candidates = state.symbols.filter(
+    s => Array.isArray(s.embedding) && s.embedding.length === EMBED_CONFIG.DIM
+  );
+
+  if (!candidates.length) {
+    log('Retrieval: keine Symbole mit Embeddings vorhanden. Zuerst Commit anlegen.', 'warn');
+    return [];
+  }
+
+  const scored = candidates.map(s => ({
+    nodeId: s.id,
+    similarity: cosineSim(queryVec, s.embedding),
+    name: s.name,
+    kind: s.kind,
+    path: s.path,
+    startLine: s.startLine,
+    endLine: s.endLine,
+    commitId: s.commitId,
+    content: s.content
+  }));
+
+  // Deterministisch: stabile Sortierung bei Gleichstand über nodeId
+  scored.sort((a, b) => {
+    if (b.similarity !== a.similarity) return b.similarity - a.similarity;
+    return String(a.nodeId).localeCompare(String(b.nodeId));
+  });
+
+  const top = scored.slice(0, topK).map((r, i) => ({
+    ...r,
+    rank: i + 1
+  }));
+
+  if (slot === 1) {
+    state.retrieval.query1 = q;
+    state.retrieval.results1 = top;
+  } else {
+    state.retrieval.query2 = q;
+    state.retrieval.results2 = top;
+  }
+
+  // Highlight-Map aus aktuellem Slot (und ggf. Intersection) neu aufbauen
+  rebuildHighlightMap();
+  state.retrieval.active = true;
+  renderRetrievalResults(slot);
+  rebuildScene();
+
+  log(`Retrieval Q${slot}: ${top.length} Treffer · Top-Sim ${top[0] ? top[0].similarity.toFixed(4) : '—'}`, 'ok');
+  return top;
+}
+
+/**
+ * FUNKTION: rebuildHighlightMap()
+ *
+ * ZWECK:
+ * Leitet aus results1, results2 und intersectionIds die Intensitäten ab.
+ * Intensität:
+ *   4 = Intersection (beide Queries)
+ *   3 = Top 1–3 des aktiven/letzten Queries
+ *   2 = Top 4–8
+ *   1 = Top 9–K
+ *   0 = kein Treffer
+ *
+ * Speichert nur in state.retrieval.highlightMap — keine Mutation der Nodes.
+ */
+function rebuildHighlightMap() {
+  const map = new Map();
+  const inter = new Set(state.retrieval.intersectionIds);
+
+  function applyResults(results) {
+    for (const r of results) {
+      if (inter.has(r.nodeId)) {
+        map.set(r.nodeId, 4);
+        continue;
+      }
+      let intensity = 1;
+      if (r.rank <= 3) intensity = 3;
+      else if (r.rank <= 8) intensity = 2;
+      const prev = map.get(r.nodeId) || 0;
+      if (intensity > prev) map.set(r.nodeId, intensity);
+    }
+  }
+
+  applyResults(state.retrieval.results1);
+  applyResults(state.retrieval.results2);
+
+  // Intersection immer stärkste Stufe
+  for (const id of inter) {
+    map.set(id, 4);
+  }
+
+  state.retrieval.highlightMap = map;
+}
+
+/**
+ * FUNKTION: computeRetrievalIntersection()
+ *
+ * ZWECK:
+ * Berechnet die Schnittmenge der Node-IDs aus results1 und results2.
+ * Speichert in state.retrieval.intersectionIds und aktualisiert Highlights.
+ */
+function computeRetrievalIntersection() {
+  const set1 = new Set(state.retrieval.results1.map(r => r.nodeId));
+  const inter = state.retrieval.results2
+    .filter(r => set1.has(r.nodeId))
+    .map(r => r.nodeId);
+
+  // Deterministische Reihenfolge: nach max. Similarity aus beiden Queries
+  const simMap = new Map();
+  for (const r of [...state.retrieval.results1, ...state.retrieval.results2]) {
+    const prev = simMap.get(r.nodeId) || 0;
+    if (r.similarity > prev) simMap.set(r.nodeId, r.similarity);
+  }
+  inter.sort((a, b) => (simMap.get(b) || 0) - (simMap.get(a) || 0));
+
+  state.retrieval.intersectionIds = inter;
+  rebuildHighlightMap();
+  renderRetrievalResults(0); // 0 = Intersection-Ansicht
+  rebuildScene();
+
+  log(`Intersection: ${inter.length} gemeinsame Nodes`, inter.length ? 'ok' : 'warn');
+  return inter;
+}
+
+/**
+ * FUNKTION: clearRetrieval()
+ *
+ * ZWECK:
+ * Löscht alle Retrieval-Ergebnisse und Highlights. Graph bleibt strukturell gleich.
+ */
+function clearRetrieval() {
+  state.retrieval.query1 = '';
+  state.retrieval.query2 = '';
+  state.retrieval.results1 = [];
+  state.retrieval.results2 = [];
+  state.retrieval.intersectionIds = [];
+  state.retrieval.highlightMap = new Map();
+  state.retrieval.active = false;
+  const panel = $('retrievalResults');
+  if (panel) panel.innerHTML = '<div style="color:var(--muted)">Noch keine Query.</div>';
+  const interBox = $('retrievalIntersection');
+  if (interBox) {
+    interBox.style.display = 'none';
+    interBox.innerHTML = '';
+  }
+  rebuildScene();
+  log('Retrieval gelöscht.', 'info');
+}
+
+/**
+ * FUNKTION: renderRetrievalResults()
+ *
+ * ZWECK:
+ * Füllt das Debug-Panel mit den aktuellen Treffern (Q1, Q2 oder Intersection).
+ */
+function renderRetrievalResults(slot) {
+  const el = $('retrievalResults');
+  const interBox = $('retrievalIntersection');
+  if (!el) return;
+
+  let results = [];
+  let title = '';
+  if (slot === 1) {
+    results = state.retrieval.results1;
+    title = `Q1 · Top-${results.length}`;
+  } else if (slot === 2) {
+    results = state.retrieval.results2;
+    title = `Q2 · Top-${results.length}`;
+  } else {
+    // Intersection view: show intersection members with their best sim
+    const idSet = new Set(state.retrieval.intersectionIds);
+    const combined = [...state.retrieval.results1, ...state.retrieval.results2];
+    const best = new Map();
+    for (const r of combined) {
+      if (!idSet.has(r.nodeId)) continue;
+      const prev = best.get(r.nodeId);
+      if (!prev || r.similarity > prev.similarity) best.set(r.nodeId, r);
+    }
+    results = state.retrieval.intersectionIds
+      .map(id => best.get(id))
+      .filter(Boolean)
+      .map((r, i) => ({ ...r, rank: i + 1 }));
+    title = `∩ INTERSECTION · ${results.length}`;
+  }
+
+  if (!results.length) {
+    el.innerHTML = `<div style="color:var(--muted)">${title || 'Keine Treffer.'}</div>`;
+  } else {
+    el.innerHTML = `<div style="color:var(--yellow);margin-bottom:4px">${esc(title)}</div>` +
+      results.map(r => `
+        <div class="resItem" data-id="${esc(r.nodeId)}">
+          <span class="resRank">#${r.rank}</span>
+          <span class="resSim">${r.similarity.toFixed(4)}</span>
+          · <b>${esc(r.kind)}</b> ${esc(r.name)}
+          <div class="resMeta">${esc(r.path)} · L${r.startLine}–${r.endLine} · ${esc(r.nodeId)}</div>
+        </div>
+      `).join('');
+
+    el.querySelectorAll('.resItem').forEach(item => {
+      item.onclick = () => {
+        const id = item.dataset.id;
+        const sym = state.symbols.find(s => s.id === id);
+        if (sym) {
+          if (state.selectedCommitId !== sym.commitId) {
+            selectCommit(sym.commitId);
+          }
+          selectNode('symbol', id);
+        }
+      };
+    });
+  }
+
+  if (interBox) {
+    if (state.retrieval.intersectionIds.length) {
+      interBox.style.display = 'block';
+      interBox.innerHTML = `<b style="color:var(--pink)">∩ ${state.retrieval.intersectionIds.length} Nodes</b><br>` +
+        state.retrieval.intersectionIds.map(id => {
+          const s = state.symbols.find(x => x.id === id);
+          return s ? `${esc(s.kind)}:${esc(s.name)}` : esc(id);
+        }).join(', ');
+    } else {
+      interBox.style.display = 'none';
+      interBox.innerHTML = '';
+    }
   }
 }
 
@@ -1589,6 +1974,10 @@ function rebuildScene() {
     const positions = new Float32Array(n * 3);
     const kinds = new Float32Array(n);
     const selected = new Float32Array(n);
+    // Retrieval highlight intensity: 0=none, 1=weak, 2=medium, 3=strong, 4=intersection
+    // Pure visualization — does not alter positions, embeddings, or graph structure
+    const highlights = new Float32Array(n);
+    const hlMap = state.retrieval.highlightMap;
 
     graphNodes.forEach((node, i) => {
       positions[i * 3] = node.position[0];
@@ -1599,32 +1988,43 @@ function rebuildScene() {
         (node.kind === 'commit' && node.id === state.selectedCommitId) ||
         (node.id === state.selectedNodeId)
           ? 1 : 0;
+      highlights[i] = hlMap.has(node.id) ? (hlMap.get(node.id) || 0) : 0;
     });
 
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
     geo.setAttribute('aKind', new THREE.BufferAttribute(kinds, 1));
     geo.setAttribute('aSelected', new THREE.BufferAttribute(selected, 1));
+    geo.setAttribute('aHighlight', new THREE.BufferAttribute(highlights, 1));
 
     const mat = new THREE.ShaderMaterial({
       vertexShader: `
         attribute float aKind;
         attribute float aSelected;
+        attribute float aHighlight;
         varying float vKind;
         varying float vSelected;
+        varying float vHighlight;
         void main() {
           vKind = aKind;
           vSelected = aSelected;
+          vHighlight = aHighlight;
           vec4 mv = modelViewMatrix * vec4(position, 1.0);
           gl_Position = projectionMatrix * mv;
           float size = aKind < 0.5 ? 12.0 : aKind < 1.5 ? 9.0 : 6.5;
           if (aSelected > 0.5) size *= 1.35;
+          // Retrieval highlight enlarges points (visualization only)
+          if (aHighlight > 3.5) size *= 1.9;
+          else if (aHighlight > 2.5) size *= 1.65;
+          else if (aHighlight > 1.5) size *= 1.4;
+          else if (aHighlight > 0.5) size *= 1.2;
           gl_PointSize = size * (260.0 / max(40.0, -mv.z));
         }
       `,
       fragmentShader: `
         varying float vKind;
         varying float vSelected;
+        varying float vHighlight;
         void main() {
           vec2 p = gl_PointCoord - 0.5;
           float r = length(p);
@@ -1635,9 +2035,21 @@ function rebuildScene() {
           vec3 cyan = vec3(0.0, 0.9, 1.0);
           vec3 green = vec3(0.0, 1.0, 0.62);
           vec3 yellow = vec3(1.0, 0.9, 0.0);
+          // Retrieval palette (does not change base identity colors when highlight=0)
+          vec3 hlWeak   = vec3(1.0, 0.55, 0.15);  // orange
+          vec3 hlMed    = vec3(1.0, 0.35, 0.05);  // deep orange
+          vec3 hlStrong = vec3(1.0, 0.15, 0.05);  // red-orange
+          vec3 hlInter  = vec3(1.0, 0.0, 0.85);   // magenta (intersection)
           vec3 c = vKind < 0.5 ? pink : vKind < 1.5 ? cyan : green;
           if (vSelected > 0.5) c = yellow;
-          gl_FragColor = vec4(c, max(core, glow * 0.65));
+          // Highlight overrides base color for matched nodes only
+          if (vHighlight > 3.5) c = hlInter;
+          else if (vHighlight > 2.5) c = hlStrong;
+          else if (vHighlight > 1.5) c = hlMed;
+          else if (vHighlight > 0.5) c = hlWeak;
+          float alpha = max(core, glow * 0.65);
+          if (vHighlight > 0.5) alpha = max(alpha, 0.9);
+          gl_FragColor = vec4(c, alpha);
         }
       `,
       transparent: true,
@@ -1817,9 +2229,34 @@ $('focusTimelineBtn').onclick = () => {
   controls.update();
 };
 
+// --- Semantic Retrieval Debug UI ---
+$('showRetrievalBtn').onclick = () => {
+  const p = $('retrievalPanel');
+  p.classList.toggle('visible');
+};
+$('toggleRetrievalBtn').onclick = () => {
+  $('retrievalPanel').classList.remove('visible');
+};
+$('runQuery1Btn').onclick = async () => {
+  const q = $('retrievalQuery').value;
+  await runSemanticQuery(q, 1);
+};
+$('runQuery2Btn').onclick = async () => {
+  const q = $('retrievalQuery').value;
+  await runSemanticQuery(q, 2);
+};
+$('runIntersectBtn').onclick = () => {
+  if (!state.retrieval.results1.length || !state.retrieval.results2.length) {
+    log('Intersection: zuerst Q1 und Q2 ausführen.', 'warn');
+    return;
+  }
+  computeRetrievalIntersection();
+};
+$('clearRetrievalBtn').onclick = () => clearRetrieval();
+
 initThree();
 (async () => {
-  log('COMMIT GRAPH — Struktur + Embedding-Layer.', 'ok');
+  log('COMMIT GRAPH — Struktur + Embedding-Layer + Retrieval-Debug.', 'ok');
   await restore();
   await loadModel();
 })();
